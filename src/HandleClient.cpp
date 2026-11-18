@@ -1,5 +1,6 @@
 #include "Server.hpp"
 #include "Connection.hpp"
+#include "Response.hpp"
 
 #include <sys/socket.h>
 #include <iostream>
@@ -35,24 +36,35 @@ void Server::handleReadable(int fd)
 		if(bytesrecv > 0)
 		{
 			std::cout << "Received " << bytesrecv << " Bytes on fd" << fd << std::endl;
+			conn.touch();
 			conn.addtoBuffer(buf, bytesrecv);
+			// Still busy with the previous request (e.g. WAITING_CGI): only buffer.
+			// Re-parsing now would reset the request whose body the CGI is reading.
+			if (conn.getState() != READING)
+				return;
 			ParseResult res = parseRequest(conn.getBuffer(), conn.getRequest());
-		if (res == PARSE_DONE)
-		{
-			const HttpRequest& req = conn.getRequest();
-			std::cout << "Method: " << req.method << std::endl;
-			std::cout << "Path: " << req.path << std::endl;
-			std::cout << "Query: " << req.query << std::endl;
-			std::cout << "Body: " << req.body << std::endl;
-			conn.setState(WRITING);
-			conn.setResponse("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>Home</h1>");
-		}
-		else if (res == PARSE_ERROR)
-		{
-			std::cout << "Parse error, status: " << conn.getRequest().status << std::endl;
-			conn.setState(WRITING);
-			conn.setResponse("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-		}
+			// No default: on purpose, so -Wswitch (-Werror) breaks the build
+			// if a new ParseResult value is added and not handled here.
+			switch (res)
+			{
+				case PARSE_INCOMPLETE:
+					break;		// wait for the next POLLIN
+				case PARSE_DONE:
+				{
+					processRequest(fd, conn);
+					break;
+				}
+				case PARSE_ERROR:
+				{
+					std::cout << "Parse error, status: " << conn.getRequest().status << std::endl;
+					int status = conn.getRequest().status;
+					if (status < 400)
+						status = 400;
+					conn.setState(WRITING);
+					conn.setResponse(buildResponse(makeErrorResponse(status, conn.getConfig()), false));
+					break;
+				}
+			}
 		}
 		else if(bytesrecv <= 0)
 		{
@@ -63,6 +75,32 @@ void Server::handleReadable(int fd)
 			closeConnection(fd);
 		}
 	}
+
+// PROCESSING: decide what to do with a complete request.
+// Either we have a response right away (state WRITING), or a CGI script
+// was started and the response comes later (state WAITING_CGI).
+void Server::processRequest(int fd, Connection& conn)
+{
+	const HttpRequest& req = conn.getRequest();
+	std::cout << "Method: " << req.method << std::endl;
+	std::cout << "Path: " << req.path << std::endl;
+	std::cout << "Query: " << req.query << std::endl;
+	std::cout << "Body: " << req.body << std::endl;
+
+	// TODO (Mees): routing first (location, allowed methods -> 405)
+	std::string interpreter = findCgiInterpreter(req.path, conn.getConfig());
+	if (!interpreter.empty())
+	{
+		startCgi(fd, interpreter);
+		return;
+	}
+	// TODO (Mees): static file / upload / delete handlers fill this HttpResponse
+	HttpResponse response;
+	response.headers["Content-Type"] = "text/html";
+	response.body = "<h1>Home</h1>";
+	conn.setState(WRITING);
+	conn.setResponse(buildResponse(response, false));
+}
 
 void Server::handleWritable(int fd)
 {
@@ -79,8 +117,8 @@ void Server::handleWritable(int fd)
 		closeConnection(fd);
 		return;
 	}
-	else
-		conn.addBytes(sent);
+	conn.addBytes(sent);
+	conn.touch();
 	if(conn.getBytessend() == conn.getResponse().size())
 		closeConnection(fd);
 }

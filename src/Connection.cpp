@@ -1,7 +1,8 @@
 #include "Connection.hpp"
 
 Connection::Connection(int fd, const ServerConfig& config)
-: _fd(fd), _state(READING), _config(config), _bytesSent(0)
+: _fd(fd), _state(READING), _config(config), _bytesSent(0),
+  _lastActivity(std::chrono::steady_clock::now())
 {}
 
 
@@ -22,6 +23,7 @@ State Connection::getState()
 void Connection::setState(State s)
 {
 	_state = s;
+	touch();	// every new state gets a fresh timeout window
 }
 void Connection::setResponse(const std::string& r)
 {
@@ -60,4 +62,20 @@ void Connection::addBytes(size_t n)
 HttpRequest& Connection::getRequest()
 {
 	return _request;
+}
+
+CgiProcess& Connection::getCgi()
+{
+	return _cgi;
+}
+
+void Connection::touch()
+{
+	_lastActivity = std::chrono::steady_clock::now();
+}
+
+double Connection::secondsIdle() const
+{
+	std::chrono::duration<double> idle = std::chrono::steady_clock::now() - _lastActivity;
+	return idle.count();
 }

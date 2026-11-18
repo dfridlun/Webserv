@@ -1,8 +1,10 @@
 #pragma once
 
 #include <string>
+#include <chrono>
 #include "ServerConfig.hpp"
 #include "Http.hpp"
+#include "Cgi.hpp"
 
 enum State { READING, PROCESSING, WAITING_CGI, WRITING, CLOSING };
 
@@ -16,6 +18,8 @@ class Connection
 		size_t				_bytesSent;
 		std::string			_response;
 		HttpRequest			_request;
+		CgiProcess			_cgi;
+		std::chrono::steady_clock::time_point _lastActivity;	// last recv/send/state change
 		
 	public:
 		Connection(int fd, const ServerConfig& config);
@@ -34,4 +38,7 @@ class Connection
 		bool hasCompleteHeaders() const;
 		void addBytes(size_t n);
 		HttpRequest& getRequest();
+		CgiProcess& getCgi();
+		void touch();
+		double secondsIdle() const;
 };
