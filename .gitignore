@@ -1,3 +1,4 @@
 Webserv
 obj/
 __pycache__/
+.claude/
