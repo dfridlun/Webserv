@@ -13,6 +13,9 @@ Server::~Server() {}
 
 void Server::closeConnection(int fd)
 {
+	auto it = _connections.find(fd);
+	if (it != _connections.end())
+		stopCgi(it->second);	// kill a still-running script, close its pipes
 	close(fd);
 	_connections.erase(fd);
 }

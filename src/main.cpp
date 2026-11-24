@@ -1,6 +1,7 @@
 #include "Server.hpp"
 #include "Listener.hpp"
 #include <iostream>
+#include <csignal>
 
 int main(int argc, char **argv)
 {
@@ -12,6 +13,7 @@ int main(int argc, char **argv)
 	{
 		conf.port = 8080;
 		conf.root = "./www";
+		conf.cgi[".py"] = "/usr/bin/python3";
 		configvector.push_back(conf);
 	}
 	catch (const std::exception& e)
@@ -23,6 +25,11 @@ int main(int argc, char **argv)
 	// {
 	// 	//error handling
 	// }
+	// Writing to a pipe/socket whose other end is gone raises SIGPIPE, which
+	// kills the whole server by default (e.g. a CGI script exits without
+	// reading its body, or a client disconnects mid-send). Ignore it: the
+	// write()/send() then just returns -1 and we close that fd.
+	signal(SIGPIPE, SIG_IGN);
 	Server server(configvector);
 	server.run();
 }

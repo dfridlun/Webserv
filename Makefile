@@ -8,7 +8,9 @@ SRCS = src/main.cpp \
 		src/Connection.cpp \
 		src/Server.cpp \
 		src/HandleClient.cpp \
-		src/Http.cpp 
+		src/Http.cpp \
+		src/Response.cpp \
+		src/Cgi.cpp
 
 
 OBJS = $(SRCS:src/%.cpp=obj/%.o)
