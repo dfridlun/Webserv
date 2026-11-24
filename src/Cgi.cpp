@@ -29,8 +29,7 @@ std::string findCgiInterpreter(const std::string& path, const ServerConfig& conf
 
 static void respondError(Connection& conn, int status)
 {
-	conn.setResponse(buildResponse(makeErrorResponse(status, conn.getConfig()), false));
-	conn.setState(WRITING);
+	conn.respond(makeErrorResponse(status, conn.getConfig()));
 }
 
 // "content-type" -> "HTTP_CONTENT_TYPE"
@@ -237,10 +236,7 @@ void Server::finishCgi(Connection& conn)
 
 	HttpResponse res;
 	if (parseCgiOutput(cgi.output, res))
-	{
-		conn.setResponse(buildResponse(res, false));
-		conn.setState(WRITING);
-	}
+		conn.respond(res);
 	else
 		respondError(conn, 502);			// no valid header block from the script
 	cgi.output.clear();

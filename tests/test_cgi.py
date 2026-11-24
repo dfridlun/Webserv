@@ -51,22 +51,50 @@ class Response:
                 self.headers[k.strip().lower()] = v.strip()
 
 
+def read_response(s, buffered=b""):
+    """Read ONE response from socket s: headers, then exactly Content-Length
+    body bytes. Stops early if the server closes. Returns (raw response,
+    leftover bytes that already belong to the next response)."""
+    data = buffered
+    while True:
+        end = data.find(b"\r\n\r\n")
+        if end != -1:
+            length = 0
+            for line in data[:end].split(b"\r\n")[1:]:
+                k, _, v = line.partition(b":")
+                if k.strip().lower() == b"content-length":
+                    length = int(v.strip())
+            total = end + 4 + length
+            if len(data) >= total:
+                return data[:total], data[total:]
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            return data, b""
+        if not chunk:
+            return data, b""
+        data += chunk
+
+
+def server_closed(s, wait=1.0):
+    """True if the server closed this connection within `wait` seconds."""
+    s.settimeout(wait)
+    try:
+        return s.recv(1) == b""
+    except socket.timeout:
+        return False
+    except OSError:
+        return True
+
+
 def send(raw, timeout=CLIENT_TIMEOUT + 15):
-    """Send raw bytes, read until the server closes (we always get Connection: close)."""
+    """Open a connection, send raw bytes, read one response, close."""
     start = time.time()
     s = socket.create_connection((HOST, PORT))
     s.settimeout(timeout)
     if raw:
         s.sendall(raw)
-    data = b""
-    try:
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-    except socket.timeout:
-        pass
+    data, _ = read_response(s)
     s.close()
     return Response(data, time.time() - start)
 
@@ -206,6 +234,76 @@ def test_robustness():
         check("client disconnect kills the script", children() == 0, f"{children()} children left")
 
 
+def test_keep_alive():
+    print("Keep-alive")
+    s = socket.create_connection((HOST, PORT))
+    s.settimeout(5)
+    s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    r1 = Response(read_response(s)[0], 0)
+    s.sendall(b"GET /cgi-bin/hello.py?again=1 HTTP/1.1\r\nHost: x\r\n\r\n")
+    r2 = Response(read_response(s)[0], 0)
+    check("HTTP/1.1 default: Connection: keep-alive", r1.headers.get("connection") == "keep-alive",
+          r1.headers.get("connection"))
+    check("second request (CGI) on the same socket", r2.status == 200 and b"again=1" in r2.body, r2.status_line)
+    check("connection stays open after a response", not server_closed(s))
+    s.close()
+
+    # pipelining: three requests in ONE send, incl. a POST body and a chunked body,
+    # so the server must remove exactly the bytes of each request from its buffer
+    s = socket.create_connection((HOST, PORT))
+    s.settimeout(5)
+    s.sendall(b"POST /cgi-bin/echo.py HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nfirst"
+              b"POST /cgi-bin/echo.py HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+              b"6\r\nsecond\r\n0\r\n\r\n"
+              b"GET /cgi-bin/hello.py?third=3 HTTP/1.1\r\nHost: x\r\n\r\n")
+    raw1, rest = read_response(s)
+    raw2, rest = read_response(s, rest)
+    raw3, rest = read_response(s, rest)
+    a, b, c = Response(raw1, 0), Response(raw2, 0), Response(raw3, 0)
+    check("pipelined: 3 requests in one packet, 3 answers in order",
+          a.body == b"first" and b.body == b"second" and b"third=3" in c.body,
+          f"{a.body[:20]!r} {b.body[:20]!r} {c.body[:30]!r}")
+    s.close()
+
+    s = socket.create_connection((HOST, PORT))
+    s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    r = Response(read_response(s)[0], 0)
+    check("Connection: close -> 'close' header + server closes",
+          r.headers.get("connection") == "close" and server_closed(s))
+    s.close()
+
+    s = socket.create_connection((HOST, PORT))
+    s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+    r = Response(read_response(s)[0], 0)
+    check("HTTP/1.0 without keep-alive -> closes", r.headers.get("connection") == "close" and server_closed(s))
+    s.close()
+
+    s = socket.create_connection((HOST, PORT))
+    s.sendall(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+    r = Response(read_response(s)[0], 0)
+    check("HTTP/1.0 + Connection: keep-alive -> stays open",
+          r.headers.get("connection") == "keep-alive" and not server_closed(s))
+    s.close()
+
+    s = socket.create_connection((HOST, PORT))
+    s.sendall(b"GET /\r\n\r\n")
+    r = Response(read_response(s)[0], 0)
+    check("parse error -> 400 and close", r.status == 400 and server_closed(s), r.status_line)
+    s.close()
+
+    # 50 requests on one connection
+    s = socket.create_connection((HOST, PORT))
+    s.settimeout(5)
+    ok = True
+    for i in range(50):
+        s.sendall(f"POST /cgi-bin/echo.py HTTP/1.1\r\nHost: x\r\nContent-Length: {len(str(i))}\r\n\r\n{i}".encode())
+        if Response(read_response(s)[0], 0).body != str(i).encode():
+            ok = False
+            break
+    check("50 CGI requests in a row on one connection", ok, f"failed at {i}")
+    s.close()
+
+
 def test_timeouts():
     print(f"Timeouts (running in parallel, ~{CLIENT_TIMEOUT}s)")
     cases = {
@@ -213,9 +311,25 @@ def test_timeouts():
         "half the headers, then silence -> 408": (b"GET / HTTP/1.1\r\nHost: x\r\n", 408, CLIENT_TIMEOUT),
         "half the body, then silence -> 408": (b"POST / HTTP/1.1\r\nContent-Length: 99\r\n\r\nhal", 408, CLIENT_TIMEOUT),
         "connect and send nothing -> closed": (b"", 0, CLIENT_TIMEOUT),
+        "idle keep-alive connection -> closed": ("KEEPALIVE", 0, CLIENT_TIMEOUT),
     }
+
+    def idle_keep_alive():
+        # one request, then stay silent: the server must close after the timeout
+        s = socket.create_connection((HOST, PORT))
+        s.settimeout(CLIENT_TIMEOUT + 15)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        read_response(s)
+        start = time.time()
+        closed = s.recv(1) == b""
+        r = Response(b"", time.time() - start)
+        if not closed:
+            r.status = -1
+        s.close()
+        return r
     got = {}
-    threads = [threading.Thread(target=lambda n=n, raw=c[0]: got.__setitem__(n, send(raw)))
+    threads = [threading.Thread(target=lambda n=n, raw=c[0]: got.__setitem__(
+                   n, idle_keep_alive() if raw == "KEEPALIVE" else send(raw)))
                for n, c in cases.items()]
     for th in threads:
         th.start()
@@ -260,6 +374,7 @@ def main():
         test_cgi_output_handling()
         test_errors()
         test_robustness()
+        test_keep_alive()
         if not args.quick:
             test_timeouts()
         check("server still running at the end", server_alive())

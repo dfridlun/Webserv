@@ -1,7 +1,7 @@
-# CGI, responses and timeouts
+# CGI, responses, keep-alive and timeouts
 
 How webserv turns a request into a response, runs CGI scripts, and makes sure no request hangs forever.
-This covers Daniel's part (see `HANDOFF.md` §8): `Response.*`, `Cgi.*`, the timeout code in `Eventloop.cpp`, and `tests/test_cgi.py`.
+This covers Daniel's part (see `HANDOFF.md` §8): `Response.*`, `Cgi.*`, keep-alive, the timeout code in `Eventloop.cpp`, and `tests/test_cgi.py`.
 
 **Contents**
 
@@ -10,6 +10,7 @@ This covers Daniel's part (see `HANDOFF.md` §8): `Response.*`, `Cgi.*`, the tim
 3. [New concepts](#3-new-concepts) (read this first if pipes/fork/CGI are new to you)
 4. [Workflow: one CGI request, step by step](#4-workflow-one-cgi-request-step-by-step)
 5. [Building responses](#5-building-responses)
+5b. [Keep-alive](#5b-keep-alive)
 6. [Timeouts](#6-timeouts)
 7. [Status codes: who sends what](#7-status-codes-who-sends-what)
 8. [Subject rules and how we follow them](#8-subject-rules-and-how-we-follow-them)
@@ -27,12 +28,15 @@ Every client is a `Connection` with a **state**. The single `poll()` loop in `Se
             accept()
                |
                v
-        +-------------+   recv() + parseRequest()
+        +-------------+   recv() + processBuffer()
         |   READING   |<----------------------------+
         +-------------+                             |
                | PARSE_DONE          PARSE_ERROR    |
                v                         |          |
-        processRequest()                 |    (keep-alive: TODO)
+        processRequest()                 |    keep-alive:
+          |          |                   |    resetForNextRequest()
+          |          |                   |    (+ processBuffer() if the
+          |          |                   |     next request is buffered)
           |          |                   |          |
    not CGI|          |CGI: startCgi()    |          |
           |          v                   |          |
@@ -46,8 +50,10 @@ Every client is a `Connection` with a **state**. The single `poll()` loop in `Se
         |              WRITING              |  send() until done
         +-----------------------------------+       |
                          |                          |
-                         v                          |
-                 closeConnection(fd) ---------------+
+              keep-alive? ---- yes -----------------+
+                         | no
+                         v
+                 closeConnection(fd)
 ```
 
 Three things can end a connection early, from any state:
@@ -66,10 +72,10 @@ Three things can end a connection early, from any state:
 | `include/Response.hpp`, `src/Response.cpp` | `HttpResponse` struct, `buildResponse()`, `reasonPhrase()`, `makeErrorResponse()`, `parseCgiOutput()`. No I/O at all, just strings in → strings out. |
 | `include/Cgi.hpp` | `CgiProcess` struct (the state of one running script), `findCgiInterpreter()` |
 | `src/Cgi.cpp` | Everything that touches a CGI process: `startCgi()`, `closeServerFds()`, `handleCgiEvent()`, `finishCgi()`, `stopCgi()`, `closeCgiFd()`, `reapChildren()`, plus the env var builder |
-| `src/HandleClient.cpp` | `handleReadable()` (switch on `ParseResult`), `processRequest()` (the PROCESSING step: CGI or not), `handleWritable()` |
+| `src/HandleClient.cpp` | `handleReadable()` (recv), `processBuffer()` (parse + switch on `ParseResult`), `processRequest()` (the PROCESSING step: CGI or not), `handleWritable()` (send, then close or keep-alive reset) |
 | `src/Eventloop.cpp` | `run()` (builds the poll list incl. CGI pipes, dispatches events), `checkTimeouts()`, the timeout constants |
 | `src/Server.cpp` | `closeConnection()` (now also calls `stopCgi()`) |
-| `src/Connection.cpp` | `touch()` / `secondsIdle()` for timeouts; `setState()` also resets the timer |
+| `src/Connection.cpp` | `respond()` (the one way to answer), `resetForNextRequest()` (keep-alive), `touch()` / `secondsIdle()` for timeouts; `setState()` also resets the timer |
 | `src/main.cpp` | `signal(SIGPIPE, SIG_IGN)`, the temporary `.py` → `/usr/bin/python3` mapping |
 | `tests/test_cgi.py` | 30 automated checks |
 | `www/cgi-bin/` | `hello.py`, `echo.py` (demo), `test/*.py` (one script per edge case) |
@@ -317,6 +323,61 @@ Builds a small HTML page like `<h1>404 Not Found</h1>` (the subject requires def
 
 ---
 
+## 5b. Keep-alive
+
+Without keep-alive, every request costs a new TCP connection (handshake, a new fd, `accept()`). Browsers load a page plus its CSS, images and scripts over a few connections that they **reuse**, so HTTP/1.1 makes keep-alive the default.
+
+### When do we keep the connection open?
+
+`wantsKeepAlive(req)` in `Response.cpp`:
+
+| Request | Keep open? |
+|---|---|
+| HTTP/1.1, no `Connection` header | yes (1.1 default) |
+| HTTP/1.1 + `Connection: close` | no |
+| HTTP/1.0, no `Connection` header | no (1.0 default) |
+| HTTP/1.0 + `Connection: keep-alive` | yes |
+
+We override that and always close:
+
+| Case | Why |
+|---|---|
+| Parse error (400, 501, ...) | We no longer know where the next request starts in the byte stream |
+| 408 Request Timeout | The request never completed |
+
+A 504 from a CGI timeout keeps the decision: the request itself was fine.
+
+The response always says what we decided (`Connection: keep-alive` or `Connection: close`). `Content-Length` is essential here: on a kept-open connection it's the **only** way the client knows where the response ends.
+
+### `respond()` and the reset
+
+Every place that answers calls `conn.respond(HttpResponse)`. It builds the response with the connection's keep-alive flag and switches to `WRITING`, so no call site can forget the right `Connection` header.
+
+When `handleWritable()` has sent the last byte:
+- **no keep-alive** → `closeConnection()`
+- **keep-alive** → `resetForNextRequest()`: remove this request's bytes from the buffer, clear request/response/`bytesSent`/CGI state, back to `READING` (which also restarts the idle timer).
+
+### Pipelining: why the parser reports `req.length`
+
+A client may send several requests without waiting for answers. They all land in the same `_buffer`:
+
+```
+_buffer:  [POST /a ... Content-Length: 5 ... first][GET /b ...][GET /c ...]
+           <--------- req.length -------------->
+```
+
+After answering the first, we must remove **exactly** its bytes and keep the rest. Only the parser knows where a request ends (after the headers, after `Content-Length` bytes, or after the last chunk + trailers), so it now stores that in `HttpRequest::length`.
+
+There's one more trap. The next request is already in **our** buffer, not in the kernel's, so `poll()` will never report `POLLIN` for it. If we just waited, the client would wait forever too. So after the reset, `handleWritable()` calls `processBuffer()` right away when the buffer isn't empty.
+
+Data that arrives while a CGI script runs is buffered but not parsed (§3.10). After the response it's handled the same way, through `processBuffer()`.
+
+### Idle keep-alive connections
+
+A kept-open connection with nothing in its buffer is in `READING` with an empty buffer. After `CLIENT_TIMEOUT_SEC` (30 s) without a new request, `checkTimeouts()` closes it silently (§6).
+
+---
+
 ## 6. Timeouts
 
 Subject: *"A request to your server should never hang indefinitely."*
@@ -336,8 +397,8 @@ Constants at the top of `src/Eventloop.cpp`:
 | State | Condition | Action |
 |---|---|---|
 | `WAITING_CGI` | script running > 10 s | `stopCgi()` (kill), **504**, → `WRITING` |
-| `READING`, buffer not empty | no data for 30 s | **408 Request Timeout**, → `WRITING` |
-| `READING`, buffer empty | nothing received for 30 s | close (nothing to answer) |
+| `READING`, buffer not empty | no data for 30 s | **408 Request Timeout** (keep-alive off), → `WRITING` |
+| `READING`, buffer empty | nothing received for 30 s (new connection, or idle keep-alive) | close (nothing to answer) |
 | `WRITING` | client not reading for 30 s | close |
 
 Connections to close are collected in a vector first and closed after the loop, because `closeConnection()` erases from `_connections`, and erasing while iterating would break the iterator.
@@ -394,7 +455,7 @@ python3 tests/test_cgi.py --quick               # skip the timeout tests
 python3 tests/test_cgi.py --no-start            # use an already running server
 ```
 
-The script starts `./Webserv` itself, sends **raw bytes** over sockets (so it can send half requests, stay silent, or hang up mid-script), prints PASS/FAIL, and exits 1 on any failure.
+The script starts `./Webserv` itself, sends **raw bytes** over sockets (so it can send half requests, stay silent, or hang up mid-script), prints PASS/FAIL, and exits 1 on any failure. It reads each response by its `Content-Length` (`read_response()`), not until the server closes, because with keep-alive the server doesn't close.
 
 | Group | What it proves |
 |---|---|
@@ -402,7 +463,8 @@ The script starts `./Webserv` itself, sends **raw bytes** over sockets (so it ca
 | Output handling | 404, 502 (no headers), `Status:` → 418, all `Content-Length` cases (§5.4) |
 | Parser errors | 400, 501, error page with a correct length |
 | Robustness | Script ignoring a 2 MB body (SIGPIPE, §3.8), no leaked fds (§3.6), normal request served during a slow CGI, 30 parallel CGIs, disconnect kills the script (§3.10) |
-| Timeouts | 504 after 10 s, 408 after 30 s (twice), silent connection closed, no zombies left |
+| Keep-alive | 1.1 default, second request on the same socket, 3 pipelined requests (POST, chunked, GET) in one packet, `Connection: close`, HTTP/1.0 with and without keep-alive, parse error closes, 50 requests on one connection |
+| Timeouts | 504 after 10 s, 408 after 30 s (twice), silent connection closed, idle keep-alive connection closed, no zombies left |
 
 Test scripts in `www/cgi-bin/test/` (each has a comment explaining what it demonstrates; handy for the evaluation demo):
 
@@ -465,6 +527,12 @@ Writing to its stdin fails. `SIGPIPE` is ignored, so `write()` returns -1 and we
 **"How does the CGI know the body length for a chunked request?"**
 The parser un-chunks it, we set `CONTENT_LENGTH` to the decoded length, and we close stdin after the last byte, so EOF marks the end.
 
+**"How does keep-alive work in your server?"**
+After the last byte is sent, `resetForNextRequest()` removes this request's bytes from the buffer (`req.length`), clears the per-request state and goes back to `READING`. If the next request is already buffered, it's parsed right away, because `poll()` won't report data we already read (§5b).
+
+**"When do you close instead?"**
+`Connection: close`, HTTP/1.0 without `Connection: keep-alive`, parse errors and 408. Idle kept-open connections are closed after 30 s.
+
 **"Why steady_clock?"**
 It never jumps, unlike the wall clock, and it's standard C++, not a forbidden system call (§3.11).
 
@@ -479,6 +547,8 @@ It never jumps, unlike the wall clock, and it's standard C++, not a forbidden sy
 | "Add a header to every response, e.g. `Server: webserv`" | One `out << ...` line in `buildResponse()` |
 | "Return 500 instead of 502 for broken CGI output" | `respondError(conn, 502)` in `finishCgi()` |
 | "Make the error page show something else" | `makeErrorResponse()` |
+| "Close after every response again" | `conn.setKeepAlive(false)` instead of `wantsKeepAlive(...)` in `processBuffer()` |
+| "Close keep-alive connections after N requests" | Add a request counter to `Connection`, increment in `resetForNextRequest()`, set keep-alive to false at N |
 | "Show how long the script ran" | `cgi.start` is already stored; compute `steady_clock::now() - cgi.start` in `finishCgi()` |
 
 ---
@@ -490,7 +560,6 @@ It never jumps, unlike the wall clock, and it's standard C++, not a forbidden sy
 | CGI mapping is hardcoded in `main.cpp` | Mees: the config parser fills `ServerConfig::cgi`, probably per location |
 | Path resolution is `root + path` with a simple `..` check | Mees: proper routing / normalization |
 | `error_page` from config not used yet | Daniel: `makeErrorResponse()` already takes the config |
-| No keep-alive (always `Connection: close`) | Daniel: reset buffer/request/response/`bytesSent` after a response, and handle data buffered during `WAITING_CGI` |
 | No `client_max_body_size` (413) or max header size | Daniel |
 | `poll()` returning -1 only prints a message | Daniel |
 | No `SO_REUSEADDR` on the listener | Marc (one `setsockopt` before `bind`) |

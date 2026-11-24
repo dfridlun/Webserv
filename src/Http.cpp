@@ -96,13 +96,17 @@ static ParseResult parseChunkSize(const std::string& raw, size_t pos,
 }
 
 // na de 0-chunk: ofwel meteen "\r\n", ofwel trailers tot "\r\n\r\n"
-static bool lastChunkComplete(const std::string& raw, size_t pos)
+// Returns where the request ends, or npos if it is not complete yet.
+static size_t lastChunkEnd(const std::string& raw, size_t pos)
 {
 	if (raw.size() < pos + 2)
-		return false;
+		return std::string::npos;
 	if (raw.compare(pos, 2, "\r\n") == 0)
-		return true;
-	return raw.find("\r\n\r\n", pos) != std::string::npos;
+		return pos + 2;
+	size_t trailersEnd = raw.find("\r\n\r\n", pos);
+	if (trailersEnd == std::string::npos)
+		return std::string::npos;
+	return trailersEnd + 4;
 }
 
 static ParseResult decodeChunked(const std::string& raw, size_t pos, HttpRequest& req)
@@ -121,9 +125,11 @@ static ParseResult decodeChunked(const std::string& raw, size_t pos, HttpRequest
 
 		if (size == 0)
 		{
-			if (!lastChunkComplete(raw, pos))
+			size_t end = lastChunkEnd(raw, pos);
+			if (end == std::string::npos)
 				return PARSE_INCOMPLETE;
 			req.body = body;
+			req.length = end;
 			return PARSE_DONE;
 		}
 		if (raw.size() < pos + size + 2)
@@ -152,6 +158,7 @@ static ParseResult parseBody(const std::string& raw, size_t bodyStart, HttpReque
 {
 	auto te = req.headers.find("transfer-encoding");
 	auto cl = req.headers.find("content-length");
+	req.length = bodyStart;		// no body: the request ends after the headers
 
 	if (te != req.headers.end())
 	{
@@ -169,6 +176,7 @@ static ParseResult parseBody(const std::string& raw, size_t bodyStart, HttpReque
 		if (raw.size() - bodyStart < len)
 			return PARSE_INCOMPLETE;
 		req.body = raw.substr(bodyStart, len);
+		req.length = bodyStart + len;
 	}
 	return PARSE_DONE;
 }

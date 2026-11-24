@@ -34,6 +34,19 @@ static bool hasHeader(const std::map<std::string, std::string>& headers, const s
 
 // ---------- public ----------
 
+bool wantsKeepAlive(const HttpRequest& req)
+{
+	std::string connection;
+	auto it = req.headers.find("connection");		// header names are lowercase
+	if (it != req.headers.end())
+		connection = toLower(it->second);
+	if (connection.find("close") != std::string::npos)
+		return false;
+	if (req.version == "HTTP/1.0")
+		return connection.find("keep-alive") != std::string::npos;
+	return true;
+}
+
 std::string reasonPhrase(int status)
 {
 	switch (status)

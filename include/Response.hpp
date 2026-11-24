@@ -3,6 +3,7 @@
 #include <string>
 #include <map>
 #include "ServerConfig.hpp"
+#include "Http.hpp"
 
 // What handlers (Mees) and CGI (Daniel) hand back.
 // buildResponse() turns this into the raw bytes we send().
@@ -12,6 +13,10 @@ struct HttpResponse
 	std::map<std::string, std::string> headers;	// e.g. "Content-Type" -> "text/html"
 	std::string body;
 };
+
+// Does the client want the connection kept open after this request?
+// HTTP/1.1: yes unless "Connection: close". HTTP/1.0: only with "Connection: keep-alive".
+bool wantsKeepAlive(const HttpRequest& req);
 
 // "OK", "Not Found", ... for a status code.
 std::string reasonPhrase(int status);

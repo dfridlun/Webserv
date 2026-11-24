@@ -107,8 +107,7 @@ void Server::checkTimeouts()
 			{
 				std::cout << "CGI timeout on fd " << entry.first << std::endl;
 				stopCgi(conn);	// kill the script, close its pipes
-				conn.setResponse(buildResponse(makeErrorResponse(504, conn.getConfig()), false));
-				conn.setState(WRITING);
+				conn.respond(makeErrorResponse(504, conn.getConfig()));	// request itself was fine: keep-alive stays as decided
 			}
 		}
 		else if (conn.secondsIdle() > CLIENT_TIMEOUT_SEC)
@@ -118,8 +117,8 @@ void Server::checkTimeouts()
 			if (state == READING && !conn.getBuffer().empty())
 			{
 				std::cout << "Request timeout on fd " << entry.first << std::endl;
-				conn.setResponse(buildResponse(makeErrorResponse(408, conn.getConfig()), false));
-				conn.setState(WRITING);
+				conn.setKeepAlive(false);	// the request never completed: close after the 408
+				conn.respond(makeErrorResponse(408, conn.getConfig()));
 			}
 			else
 				toClose.push_back(entry.first);	// idle, or client stopped reading our response

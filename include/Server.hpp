@@ -15,6 +15,7 @@ class Server
 		std::map<int, int>		_cgiFds;		// CGI pipe fd -> client fd
 		std::vector<pid_t>		_children;	// finished/killed CGI children not reaped yet
 
+		void processBuffer(int fd, Connection& conn);
 		void processRequest(int fd, Connection& conn);
 		void startCgi(int clientFd, const std::string& interpreter);
 		void handleCgiEvent(int pipeFd, short revents);
